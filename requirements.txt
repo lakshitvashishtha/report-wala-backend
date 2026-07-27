@@ -1,0 +1,10 @@
+python-docx
+google-genai
+lxml
+requests
+mysql-connector-python
+PyMuPDF
+reportlab
+# Required for Microsoft Word PDF export on Windows
+docx2pdf
+pywin32 ; sys_platform == "win32"

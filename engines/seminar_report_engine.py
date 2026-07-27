@@ -1,0 +1,11 @@
+from .base_engine import BaseReportEngine
+
+class SeminarEngine(BaseReportEngine):
+    def __init__(self, metadata, job_dir, status_file=None):
+        super().__init__(metadata, job_dir, status_file)
+        self.preferred_models = ["gemini-1.5-pro", "gemini-pro-latest", "gemini-flash-latest"]
+
+    def _report_type_profile(self):
+        profile = super()._report_type_profile()
+        profile["missing"] += "\nFocus: Summary of key presentations, current trends discussed, and core conceptual takeaways."
+        return profile
