@@ -285,7 +285,7 @@ class ReportRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
-        path = unquote(parsed.path)
+        path = re.sub(r"/+", "/", unquote(parsed.path))
 
         if path == "/api/user/reports":
             self.handle_user_reports(parsed.query)
@@ -330,31 +330,32 @@ class ReportRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path == "/api/login":
+        parsed_path = re.sub(r"/+", "/", parsed.path)
+        if parsed_path == "/api/login":
             self.handle_login()
             return
             
-        if parsed.path == "/api/logout":
+        if parsed_path == "/api/logout":
             self.handle_logout()
             return
-        if parsed.path == "/api/generate":
+        if parsed_path == "/api/generate":
             self.handle_generate()
             return
 
-        if parsed.path == "/api/suggest-description":
+        if parsed_path == "/api/suggest-description":
             self.handle_suggest_description()
             return
             
-        if parsed.path == "/api/regenerate-chapter":
+        if parsed_path == "/api/regenerate-chapter":
             self.handle_regenerate_chapter()
             return
 
-        if parsed.path == "/api/suggest-outline":
+        if parsed_path == "/api/suggest-outline":
             self.handle_suggest_outline()
             return
 
-        if parsed.path.startswith("/api/cancel/"):
-            job_id = parsed.path.split("/")[-1]
+        if parsed_path.startswith("/api/cancel/"):
+            job_id = parsed_path.split("/")[-1]
             self.handle_cancel(job_id)
             return
 
