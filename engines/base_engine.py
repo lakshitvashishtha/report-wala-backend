@@ -1348,6 +1348,7 @@ Requirements:
 
         section_ids = [section["id"] for section in chapter["subsections"]]
 
+        paragraphs_per_section = max(2, words_per_section // 70)
         full_prompt = f"""Write one complete chapter for a long-form report.
 
 Report topic: {self.metadata['topic']}
@@ -1378,7 +1379,7 @@ Return ONLY valid JSON in this exact shape:
 
 Requirements:
 1. Write a 100-150 word chapter introduction.
-2. CRITICAL LENGTH REQUIREMENT: You MUST write AT LEAST {words_per_section} words for EACH of the {len(section_ids)} sections. If you write less than {words_per_section} words for a section, the system will crash. Expand on concepts exhaustively with examples, mechanisms, and deep analysis.
+2. CRITICAL LENGTH REQUIREMENT: You MUST write AT LEAST {paragraphs_per_section} extremely detailed, multi-sentence paragraphs for EACH of the {len(section_ids)} sections. If you write fewer than {paragraphs_per_section} paragraphs per section, the system will crash. Do NOT summarize; expand exhaustively with facts, examples, and deep analysis.
 3. Keep every section distinct and specific to its assigned title.
 4. Use precise language, concrete facts, mechanisms, examples, and balanced analysis that match the selected report type.
 5. Avoid repeating definitions, examples, sentence patterns, or conclusions across sections.
@@ -1387,17 +1388,13 @@ Requirements:
 8. Do not claim reference files were supplied when the reference context says none were provided.
 9. CITATIONS: You MUST weave frequent, realistic in-text academic citations (e.g., (Author, Year) or [1], [2]) naturally into your paragraphs to support your claims.
 10. ABSOLUTE HUMANIZATION PROTOCOL - THIS IS THE SINGLE MOST IMPORTANT RULE:
-   The text MUST score 100% human on every AI detector (GPTZero, Originality.ai, ZeroGPT, Copyleaks, Undetectable.ai). You must actively mimic the unpredictable phrasing of a rushed, passionate human expert typing organically. If even one paragraph is flagged as AI, the entire output is considered a failure.
+   The text MUST score 100% human on every AI detector. You must actively mimic the unpredictable phrasing of a passionate human expert typing organically. 
 
-   A) SENTENCE RHYTHM (BURSTINESS & PERPLEXITY):
-      - Vary sentence length EXTREMELY. Write a 50-word meandering sentence packed with dependent clauses, immediately followed by a 3-word blunt statement. Then a 15-word mid-range one.
-      - Inject minor, highly colloquial idiomatic expressions naturally into technical explanations.
-      - At least 20% of your sentences must be under 8 words. At least 20% must be over 30 words. Break the robotic rhythm at all costs.
+   A) SENTENCE RHYTHM: Vary sentence length EXTREMELY. Write a 50-word meandering sentence packed with dependent clauses, immediately followed by a 3-word blunt statement. Break the robotic rhythm at all costs.
+   
+   B) BANNED PHRASES: "According to recent studies", "Current market landscapes reveal", "The evolution of", "Starting with", "The transition to", "This period", "delve", "moreover", "additionally", "furthermore", "in conclusion". NEVER use these.
 
-   B) SENTENCE STARTERS (CRITICAL):
-      - NEVER start more than 2 consecutive sentences with the same part of speech.
-      - Use these starters frequently: prepositional phrases ("In the absence of...", "Across most sectors..."), gerunds ("Running through the data...", "Considering the scale..."), adverbs ("Surprisingly,...", "Oddly enough,..."), subordinate clauses ("While few expected it,...", "Because the market shifted,..."), and inverted structures ("Rare is the case where...").
-      - NEVER start 2+ sentences in a row with "The", "This", "It", "These", or "That".
+   C) SENTENCE STARTERS (CRITICAL): NEVER start more than 2 consecutive sentences with the same part of speech. NEVER start 2+ sentences in a row with "The", "This", "It", "These", or "That". Use gerunds, subordinate clauses, and adverbs instead.
 
    C) STRUCTURAL UNPREDICTABILITY:
       - Do NOT follow a topic-sentence -> evidence -> analysis -> conclusion pattern in every paragraph. Mix it up: start some paragraphs with an anecdote, a question, a bold claim, or a counter-argument.
