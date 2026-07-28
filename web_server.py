@@ -1001,7 +1001,7 @@ BRIEF: <your 2-sentence brief here>"""
         custom_chapters = payload.get("customChapters", [])
         
         from engines import get_engine_for_report
-        engine = get_engine_for_report(report_type, {})
+        engine = get_engine_for_report(report_type, {"api_key": api_key})
         section_label = engine._get_section_label()
         report_profile = getattr(engine, "report_profile", "")
 
@@ -1056,31 +1056,50 @@ BRIEF: <your 2-sentence brief here>"""
             f'{{\n  "chapters": [\n    {{\n      "title": "Introduction",\n      "subchapters": ["Background and Context", "Research Objectives"]\n    }}\n  ]\n}}'
         )
 
-        try:
-            from google.genai import types as genai_types
-            client = genai.Client(
-                api_key=api_key,
-                http_options=genai_types.HttpOptions(
-                    retry_options=genai_types.HttpRetryOptions(attempts=1),
-                    timeout=15000,
-                )
-            )
+        is_ollama = api_key.strip().lower() == "ollama" or api_key.startswith("http")
+        ollama_url = api_key.strip() if api_key.startswith("http") else "http://127.0.0.1:11434"
 
-            response = None
-            for model_name in ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]:
-                try:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
+        try:
+            response_text = None
+            if is_ollama:
+                import requests
+                local_model = os.environ.get("LOCAL_MODEL_NAME") or "qwen2.5:7b"
+                payload = {
+                    "model": local_model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "format": "json"
+                }
+                res = requests.post(f"{ollama_url}/api/generate", json=payload, timeout=120)
+                res.raise_for_status()
+                response_text = res.json().get("response", "").strip()
+            else:
+                from google.genai import types as genai_types
+                import google.genai as genai
+                client = genai.Client(
+                    api_key=api_key,
+                    http_options=genai_types.HttpOptions(
+                        retry_options=genai_types.HttpRetryOptions(attempts=1),
+                        timeout=15000,
                     )
-                    break
-                except Exception as e:
-                    print(f"Call with {model_name} failed: {e}")
-                    
-            if not response:
-                raise RuntimeError("All models failed.")
+                )
+
+                response = None
+                for model_name in ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro"]:
+                    try:
+                        response = client.models.generate_content(
+                            model=model_name,
+                            contents=prompt,
+                        )
+                        break
+                    except Exception as e:
+                        print(f"Call with {model_name} failed: {e}")
+                        
+                if not response:
+                    raise RuntimeError("All models failed.")
+                response_text = response.text
                 
-            raw_text = response.text
+            raw_text = response_text
             json_start = raw_text.find("{")
             json_end = raw_text.rfind("}") + 1
             bundle = json.loads(raw_text[json_start:json_end])
