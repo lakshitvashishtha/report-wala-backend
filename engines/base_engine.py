@@ -336,7 +336,7 @@ class BaseReportEngine:
                     time.sleep(8 - elapsed)
                 if getattr(self, "is_ollama", False):
                     import requests
-                    local_model = os.environ.get("LOCAL_MODEL_NAME") or "qwen2.5:14b"
+                    local_model = os.environ.get("LOCAL_MODEL_NAME") or "qwen2.5:7b"
                     local_ctx = int(os.environ.get("LOCAL_MODEL_CTX") or 16384)
                     payload = {
                         "model": local_model,
@@ -1301,52 +1301,10 @@ Requirements:
         target_pages = int(self.metadata.get("targetPages") or 65)
         report_type_lower = str(self.metadata.get("reportType") or "").lower()
         chapter_count = max(1, len(self.plan["chapters"]))
-        
-        # If target pages is small, front matter is disabled, so all pages are content pages.
-        # Otherwise, subtract approximate front matter (~8 pages).
-        # NOTE: actual per-section budget is calculated below using realtime_words_per_section
-        # (set by the page-tracker after each chapter), or estimated for the first chapter.
-
-        # ~200 words/page is realistic for A4 formatted docx with headings, spacing, margins.
-        # Auto-calibrated from real LibreOffice output on first use.
-        # Runs once per server start and caches the result.
-        WORDS_PER_PAGE = self._calibrate_words_per_page()
-        num_subsections = len(chapter.get("subsections", [])) or 1
-        sections_equivalent = num_subsections + 0.5  # 0.5 weight for the intro paragraph
-
-        # This is the most accurate budget since it's based on actual measured page counts.
-        if getattr(self, "realtime_words_per_section", None) is not None:
-            words_per_section = min(4000, max(30, self.realtime_words_per_section))
-            print(f"[PageTracker] Using real-time budget: {words_per_section} words/section")
-        else:
-            # First chapter: estimate from total target using calibrated words/page.
-            has_front_matter = self.metadata.get("includeFrontMatter", True)
-            # IMPORTANT: use 0 (not 1) when front matter is disabled — that extra page was
-            # shrinking the content budget and causing short page counts for small reports.
-            FRONT_MATTER_PAGES = 8 if has_front_matter else 0
-            content_target_pages = max(0.5, target_pages - FRONT_MATTER_PAGES)
-            # Subtract page break overhead: each inter-chapter break wastes ~0.5 pages on
-            # average (the partial last page of each chapter). With chapter_count chapters,
-            # there are (chapter_count - 1) breaks. Also subtract ~0.5 for references page.
-            page_break_overhead = (chapter_count - 1) * 0.5 + 0.5
-            effective_content_pages = max(0.5, content_target_pages - page_break_overhead)
-            total_content_words = effective_content_pages * WORDS_PER_PAGE
-            # Use a gentle floor of 30 so math controls section length, not an arbitrary clamp.
-            exact_words_per_section = max(30, int(total_content_words / (chapter_count * sections_equivalent)))
-            words_per_section = min(4000, exact_words_per_section)
-            print(f"[PageTracker] Initial budget: {words_per_section} w/sec "
-                  f"(target={target_pages}p, fm={has_front_matter}, content={content_target_pages}p, "
-                  f"break_overhead={page_break_overhead:.1f}p, effective={effective_content_pages:.1f}p, "
-                  f"wpp={WORDS_PER_PAGE:.0f}, chapters={chapter_count})")
-
-
-
-        # Intro is shorter than a full section
-        intro_words_min = max(30, int(words_per_section * 0.35))
-        intro_words_max = max(60, int(words_per_section * 0.60))
-        min_words = 30
-
-        
+        min_words = 60 if target_pages <= 20 else 220
+        words_per_section = max(min_words, min(2000, int(target_pages * 70 / chapter_count)))
+        if target_pages >= 100:
+            words_per_section = max(words_per_section, 2500)
         reference_context = self._load_reference_context()
         project_context = self._load_project_context()
         evidence_context = str(self.metadata.get("evidenceDetails") or "").strip()
@@ -1382,14 +1340,13 @@ Requirements:
                 "\nStudy/testing details supplied by user for report-wide context:\n"
                 f"{evidence_context}\n"
             )
-            
-        if target_pages >= 100:
-            length_instruction = f"CRITICAL REQUIREMENT: This is a 100+ page report. Each section MUST be AT LEAST {words_per_section} words. Write in EXTREME depth and detail.\n"
-        else:
-            length_instruction = f"CRITICAL: Keep this section highly concise and focused. Do not exceed {words_per_section + 100} words per section. Emphasize deep qualitative insights over fluff.\n"
+        length_instruction = (
+            "This is a 100+ page target report. Do not summarize briefly; each section must be detailed, multi-paragraph, and evidence-rich.\n"
+            if target_pages >= 100
+            else f"CRITICAL: Keep this section extremely concise. You MUST NOT exceed {words_per_section + 100} words per section. If you write too much, the report will be rejected."
+        )
 
         section_ids = [section["id"] for section in chapter["subsections"]]
-        sections_json_shape = ",\n    ".join([f'"{sid}": "full section content"' for sid in section_ids])
 
         full_prompt = f"""Write one complete chapter for a long-form report.
 
@@ -1410,11 +1367,65 @@ Return ONLY valid JSON in this exact shape:
 {{
   "introduction": "chapter introduction",
   "sections": {{
-    {sections_json_shape}
+    "{chapter_id}.1": "full section content",
+    "{chapter_id}.2": "full section content",
+    "{chapter_id}.3": "full section content",
+    "{chapter_id}.4": "full section content",
+    "{chapter_id}.5": "full section content",
+    "{chapter_id}.6": "full section content"
   }}
 }}
 
-{self._get_common_generation_requirements(words_per_section)}
+Requirements:
+1. Write a 100-150 word chapter introduction.
+2. CRITICAL LENGTH REQUIREMENT: You MUST write AT LEAST {words_per_section} words for EACH of the {len(section_ids)} sections. If you write less than {words_per_section} words for a section, the system will crash. Expand on concepts exhaustively with examples, mechanisms, and deep analysis.
+3. Keep every section distinct and specific to its assigned title.
+4. Use precise language, concrete facts, mechanisms, examples, and balanced analysis that match the selected report type.
+5. Avoid repeating definitions, examples, sentence patterns, or conclusions across sections.
+6. Do not mention prompts, report generation, or artificial intelligence.
+7. Use prose paragraphs inside each JSON string; no Markdown headings or fenced code.
+8. Do not claim reference files were supplied when the reference context says none were provided.
+9. CITATIONS: You MUST weave frequent, realistic in-text academic citations (e.g., (Author, Year) or [1], [2]) naturally into your paragraphs to support your claims.
+10. ABSOLUTE HUMANIZATION PROTOCOL - THIS IS THE SINGLE MOST IMPORTANT RULE:
+   The text MUST score 100% human on every AI detector (GPTZero, Originality.ai, ZeroGPT, Copyleaks, Undetectable.ai). You must actively mimic the unpredictable phrasing of a rushed, passionate human expert typing organically. If even one paragraph is flagged as AI, the entire output is considered a failure.
+
+   A) SENTENCE RHYTHM (BURSTINESS & PERPLEXITY):
+      - Vary sentence length EXTREMELY. Write a 50-word meandering sentence packed with dependent clauses, immediately followed by a 3-word blunt statement. Then a 15-word mid-range one.
+      - Inject minor, highly colloquial idiomatic expressions naturally into technical explanations.
+      - At least 20% of your sentences must be under 8 words. At least 20% must be over 30 words. Break the robotic rhythm at all costs.
+
+   B) SENTENCE STARTERS (CRITICAL):
+      - NEVER start more than 2 consecutive sentences with the same part of speech.
+      - Use these starters frequently: prepositional phrases ("In the absence of...", "Across most sectors..."), gerunds ("Running through the data...", "Considering the scale..."), adverbs ("Surprisingly,...", "Oddly enough,..."), subordinate clauses ("While few expected it,...", "Because the market shifted,..."), and inverted structures ("Rare is the case where...").
+      - NEVER start 2+ sentences in a row with "The", "This", "It", "These", or "That".
+
+   C) STRUCTURAL UNPREDICTABILITY:
+      - Do NOT follow a topic-sentence -> evidence -> analysis -> conclusion pattern in every paragraph. Mix it up: start some paragraphs with an anecdote, a question, a bold claim, or a counter-argument.
+      - Vary paragraph lengths: some 2 sentences, some 6 sentences, most 3-4.
+      - Occasionally use a one-sentence paragraph for emphasis.
+
+   D) VOCABULARY & PHRASING:
+      - BANNED WORDS (instant AI flag): delve, tapestry, testament, navigate, landscape, crucial, vital, pivotal, seamless, dynamic, leverage, overarching, multifaceted, transformative, underscore, beacon, robust, comprehensive, realm, nuanced, paradigm, foster, staggering, mere, undoubtedly, it is important to note, it is worth noting, plays a vital role, serves as a, has become increasingly, in today's world, in the modern era, the importance of, it can be argued that, a myriad of, plethora, additionally.
+      - BANNED TRANSITIONS: Firstly, Moreover, Furthermore, In conclusion, Consequently, Even with, However, Ultimately, Notably, Significantly, Interestingly, It should be noted.
+      - USE INSTEAD: "But", "And", "So", "Because", "Still", "That said", "Then again", "On the flip side", "What's less obvious is", "The reality is", "Worth flagging here", or strictly connect ideas without any transition word. Start sentences mid-thought occasionally.
+
+   E) HUMAN VOICE & TONE:
+      - Write like a real person who happens to be an expert - not like a textbook.
+      - Use rhetorical questions occasionally ("So why does this matter?").
+      - Use em-dashes for parenthetical asides - like this - instead of always using commas or parentheses.
+      - Express mild opinions: "This approach, frankly, has more drawbacks than advocates tend to admit."
+      - Use hedging language humans naturally use: "arguably", "tends to", "in most cases", "from what the data suggests", "it seems like".
+      - Occasionally reference the reader implicitly: "one might wonder", "consider what happens when".
+
+   F) ANTI-PATTERN RULES:
+      - NEVER use the same sentence structure (e.g., Subject-Verb-Object) more than twice in a row.
+      - NEVER repeat the same word within 3 consecutive sentences (except articles and prepositions).
+      - NEVER use paired/parallel constructions like "Not only X but also Y" or "Both X and Y" more than once per section.
+      - NEVER end 2+ consecutive paragraphs with the same syntactic pattern.
+10. CITATIONS (CRITICAL):
+    If the list below is empty, DO NOT use any in-text citations.
+    If the list is not empty, you MUST ONLY cite references from the following list (e.g., [1] or (Author, Year)).
+    DO NOT invent, fabricate, or hallucinate citations (like Goodfellow et al. or Lee) that are not explicitly provided in this list. Any hallucinated citation will result in failure: {json.dumps(self.generated_references, indent=2)}
 """
 
         chapter_schema = {
@@ -1431,144 +1442,54 @@ Return ONLY valid JSON in this exact shape:
         }
         bundle = None
         parse_error = None
+        for generation_attempt in range(2):
+            purpose = f"chapter {chapter_id}: {chapter['title']}"
+            if generation_attempt:
+                purpose += " (format repair)"
+            attempt_prompt = full_prompt
+            if generation_attempt:
+                attempt_prompt += (
+                    "\nThe previous response was invalid, incomplete, or repetitive. Regenerate the "
+                    "entire chapter from scratch. Do not reuse any sentence between fields or sections."
+                )
+            raw_text = self._call_gemini(attempt_prompt, purpose, chapter_schema, timeout=120000)
+            json_start = raw_text.find("{")
+            json_end = raw_text.rfind("}") + 1
+            try:
+                bundle = json.loads(raw_text[json_start:json_end], strict=False)
+                introduction = str(bundle["introduction"]).strip()
+                sections = bundle["sections"]
+                if len(introduction) < 200 or any(
+                    len(str(sections.get(section_id, "")).strip()) < 400
+                    for section_id in section_ids
+                ):
+                    raise ValueError("Gemini returned incomplete chapter content.")
 
-        # For large documents, single-bundle generation always truncates and wastes 2 retry API calls.
-        # Bypass single bundle attempt and generate directly in 2 batches to save API quota!
-        should_batch_directly = target_pages > 15 or words_per_section > 120
-
-        if not should_batch_directly:
-            for generation_attempt in range(2):
-                purpose = f"chapter {chapter_id}: {chapter['title']}"
-                if generation_attempt:
-                    purpose += " (format repair)"
-                attempt_prompt = full_prompt
-                if generation_attempt:
-                    attempt_prompt += (
-                        "\nThe previous response was invalid, incomplete, or repetitive. Regenerate the "
-                        "entire chapter from scratch. Do not reuse any sentence between fields or sections."
-                    )
-                raw_text = self._call_gemini(attempt_prompt, purpose, chapter_schema, timeout=120000)
-                json_start = raw_text.find("{")
-                json_end = raw_text.rfind("}") + 1
-                try:
-                    if json_start == -1 or json_end == 0:
-                        print(f"Warning: Gemini did not return a JSON object. Raw text:\n{raw_text[:500]}")
-                        raise ValueError("No JSON object found in response.")
-                    
-                    bundle = json.loads(raw_text[json_start:json_end], strict=False)
-                    introduction = str(bundle.get("introduction", "")).strip()
-                    sections = bundle.get("sections", {})
-                    if len(introduction) < 20 or any(
-                        len(str(sections.get(section_id, "")).strip()) < 50
-                        for section_id in section_ids
-                    ):
-                        raise ValueError("Gemini returned incomplete chapter content.")
-
-                    candidates = [(f"chapter_{chapter_id}_intro", introduction)]
-                    candidates.extend(
-                        (section_id, str(sections.get(section_id, "")).strip())
-                        for section_id in section_ids
-                    )
-                    duplicate_reason = self._find_duplicate_content(candidates)
-                    if duplicate_reason:
-                        raise ValueError(duplicate_reason)
-                    break
-                except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
-                    parse_error = exc
-                    bundle = None
+                candidates = [(f"chapter_{chapter_id}_intro", introduction)]
+                candidates.extend(
+                    (section_id, str(sections[section_id]).strip())
+                    for section_id in section_ids
+                )
+                duplicate_reason = self._find_duplicate_content(candidates)
+                if duplicate_reason:
+                    raise ValueError(duplicate_reason)
+                break
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                parse_error = exc
+                bundle = None
 
         if bundle is None:
-            print(f"[PageTracker] Bundle generation truncated for Chapter {chapter_id}. Splitting into 2 half-chapter batches to conserve API quota...")
-            subsections = chapter["subsections"]
-            mid = max(1, len(subsections) // 2)
-            half1 = subsections[:mid]
-            half2 = subsections[mid:]
+            raise RuntimeError(
+                f"Gemini returned invalid, incomplete, or repetitive content for chapter {chapter_id} "
+                "after one repair attempt."
+            ) from parse_error
 
-            sections = {}
-
-            # Batch 1: Intro + Half 1
-            h1_ids = [s["id"] for s in half1]
-            h1_shape = ",\n    ".join([f'"{sid}": "content"' for sid in h1_ids])
-            prompt_b1 = (
-                f"Write Introduction and first sections for Chapter {chapter_id}: {chapter['title']} of a report on '{self.metadata['topic']}'.\n"
-                f"Reference context: {reference_context}\n"
-                f"Return ONLY valid JSON:\n{{\n  \"introduction\": \"text\",\n  \"sections\": {{\n    {h1_shape}\n  }}\n}}\n\n"
-                f"{self._get_common_generation_requirements(words_per_section)}"
-            )
-            raw_b1 = self._call_gemini(prompt_b1, f"chapter {chapter_id} part 1 fallback")
-            j_start = raw_b1.find("{")
-            j_end = raw_b1.rfind("}") + 1
-            introduction = ""
-            if j_start != -1 and j_end > j_start:
-                try:
-                    b1_data = json.loads(raw_b1[j_start:j_end], strict=False)
-                    if isinstance(b1_data, dict):
-                        introduction = str(b1_data.get("introduction", "")).strip()
-                        sec_part1 = b1_data.get("sections", {})
-                        if isinstance(sec_part1, dict):
-                            for sid in h1_ids:
-                                if sid in sec_part1:
-                                    sections[sid] = str(sec_part1[sid]).strip()
-                except Exception as exc:
-                    print(f"Batch 1 JSON parse warning: {exc}")
-
-            if not introduction:
-                introduction = f"This chapter introduces the fundamental principles and analytical framework for {chapter['title']}."
-            for sid in h1_ids:
-                if sid not in sections or not sections[sid]:
-                    sections[sid] = f"Detailed analysis and observations regarding {section_map.get(sid, sid)}."
-
-            # Batch 2: Half 2
-            if half2:
-                h2_ids = [s["id"] for s in half2]
-                h2_shape = ",\n    ".join([f'"{sid}": "content"' for sid in h2_ids])
-                prompt_b2 = (
-                    f"Write remaining sections for Chapter {chapter_id}: {chapter['title']} of a report on '{self.metadata['topic']}'.\n"
-                    f"Reference context: {reference_context}\n"
-                    f"Return ONLY valid JSON:\n{{\n  \"sections\": {{\n    {h2_shape}\n  }}\n}}\n\n"
-                    f"{self._get_common_generation_requirements(words_per_section)}"
-                )
-                raw_b2 = self._call_gemini(prompt_b2, f"chapter {chapter_id} part 2 fallback")
-                j_start = raw_b2.find("{")
-                j_end = raw_b2.rfind("}") + 1
-                if j_start != -1 and j_end > j_start:
-                    try:
-                        b2_data = json.loads(raw_b2[j_start:j_end], strict=False)
-                        if isinstance(b2_data, dict):
-                            sec_part2 = b2_data.get("sections", {})
-                            if isinstance(sec_part2, dict):
-                                for sid in h2_ids:
-                                    if sid in sec_part2:
-                                        sections[sid] = str(sec_part2[sid]).strip()
-                    except Exception as exc:
-                        print(f"Batch 2 JSON parse warning: {exc}")
-
-                for sid in h2_ids:
-                    if sid not in sections or not sections[sid]:
-                        sections[sid] = f"Comprehensive evaluation and practical findings for {section_map.get(sid, sid)}."
-
-        # Allow a 15% overage buffer in trim — the AI often writes slightly more than requested
-        # due to JSON formatting overhead, and aggressively clipping to exactly words_per_section
-        # can cause consistently short page counts. Let the realtime tracker correct overage
-        # across remaining chapters instead.
-        trim_budget = int(words_per_section * 1.15)
-        trimmed_intro = self._trim_to_words(introduction, intro_words_max)
-        orig_intro_words = len(introduction.split())
-        print(f"[Trim] Ch{chapter_id} intro: {orig_intro_words} → {len(trimmed_intro.split())} words (max={intro_words_max})")
-        self.content_cache[f"{chapter_id}_intro_0"] = trimmed_intro
-
-        total_section_words = 0
+        self.content_cache[f"{chapter_id}_intro_0"] = introduction
         for subsection in chapter["subsections"]:
             subsection_id = subsection["id"]
-            raw_content = str(sections.get(subsection_id, "")).strip()
-            trimmed_content = self._trim_to_words(raw_content, trim_budget)
-            orig_words = len(raw_content.split())
-            trim_words = len(trimmed_content.split())
-            total_section_words += trim_words
-            print(f"[Trim] Ch{chapter_id} sec {subsection_id}: {orig_words} → {trim_words} words (budget={trim_budget})")
-            self.content_cache[f"{chapter_id}_{subsection_id}_0"] = trimmed_content
+            content = str(sections.get(subsection_id, "")).strip()
+            self.content_cache[f"{chapter_id}_{subsection_id}_0"] = content
 
-        print(f"[Trim] Ch{chapter_id} TOTAL: intro={len(trimmed_intro.split())} + sections={total_section_words} = {len(trimmed_intro.split()) + total_section_words} words")
         self.chapter_bundles.add(chapter_id)
 
     def generate_chapter_content(self, chapter_id, subsection_id=None, variation=0):
@@ -1637,8 +1558,8 @@ F) HUMAN VOICE: Write like a real expert - not a textbook. Use rhetorical questi
                 abstract = str(payload["abstract"]).strip()
                 if len(abstract) < 420:
                     raise ValueError("Gemini returned an incomplete abstract.")
-                self.abstract_content = self._humanize_text_postprocess(abstract)
-                return self.abstract_content
+                self.abstract_content = abstract
+                return abstract
             except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
                 last_error = exc
 
@@ -1904,18 +1825,10 @@ F) HUMAN VOICE: Write like a real expert - not a textbook. Use rhetorical questi
         from docx.oxml.shared import OxmlElement, qn
 
         print("Creating Document object...")
-        target_pages = int(self.metadata.get("targetPages") or 70)
         doc = Document()
         if 'Normal' in doc.styles:
             doc.styles['Normal'].paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
         bookmark_id_counter = [0]
-
-        def shade_cell(cell, fill):
-            tc_pr = cell._tc.get_or_add_tcPr()
-            shd = OxmlElement('w:shd')
-            shd.set(qn('w:fill'), fill)
-            tc_pr.append(shd)
-
 
         settings = doc.settings.element
         if settings.find(qn('w:updateFields')) is None:
@@ -2059,169 +1972,19 @@ F) HUMAN VOICE: Write like a real expert - not a textbook. Use rhetorical questi
                 document.add_paragraph()
                 return
 
-            def parse_markdown_table(table_lines):
-                table_rows = []
-                for line in table_lines:
-                    line = line.strip()
-                    if not line.startswith("|") or not line.endswith("|"):
-                        continue
-                    if re.match(r"^\|[\s\-\|:]+\|$", line):
-                        continue
-                    cells = [c.strip() for c in line.split("|")[1:-1]]
-                    table_rows.append(cells)
-                return table_rows
-
-            def add_word_table_from_markdown(document, table_rows):
-                if not table_rows or len(table_rows) < 2:
-                    return
-                cols_count = len(table_rows[0])
-                table = document.add_table(rows=len(table_rows), cols=cols_count)
-                table.style = 'Table Grid'
-
-                # Header
-                for col_idx, cell in enumerate(table.rows[0].cells):
-                    cell.text = table_rows[0][col_idx]
-                    shade_cell(cell, "DCEBFF")
-                    for paragraph in cell.paragraphs:
-                        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                        paragraph.paragraph_format.space_after = Pt(2)
-                        for run in paragraph.runs:
-                            set_font(run, 10, bold=True)
-
-                # Rows
-                for row_idx in range(1, len(table_rows)):
-                    row_values = table_rows[row_idx]
-                    while len(row_values) < cols_count:
-                        row_values.append("")
-                    row_cells = table.rows[row_idx].cells
-                    for col_idx in range(cols_count):
-                        row_cells[col_idx].text = row_values[col_idx]
-                        for paragraph in row_cells[col_idx].paragraphs:
-                            paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                            paragraph.paragraph_format.space_after = Pt(2)
-                            for run in paragraph.runs:
-                                set_font(run, 10)
-
-            def parse_mermaid(mermaid_lines):
-                nodes = {}
-                edges = []
-                for line in mermaid_lines:
-                    line = line.strip()
-                    if not line or "graph " in line or "flowchart " in line or "mermaid" in line:
-                        continue
-                    node_matches = re.findall(r"([a-zA-Z0-9_-]+)(?:\[\"?([^\"]+?)\"?\]|\(\"?([^\"]+?)\"?\)|\{\"?([^\"]+?)\"?\}|:\"?([^\"]+?)\"?)", line)
-                    for match in node_matches:
-                        node_id = match[0]
-                        node_text = next(t for t in match[1:] if t)
-                        nodes[node_id] = node_text
-
-                    clean_line = re.sub(r"\[\"?[^\"]+?\"?\]|\(\"?[^\"]+?\"?\)|\{\"?[^\"]+?\"?\}|:\"?[^\"]+?\"?", "", line)
-                    conn_match = re.search(r"([a-zA-Z0-9_-]+)\s*(?:-->|-->\|([^|]+)\|)\s*([a-zA-Z0-9_-]+)", clean_line)
-                    if conn_match:
-                        from_id, label, to_id = conn_match.group(1), conn_match.group(2) or "", conn_match.group(3)
-                        edges.append((from_id, label, to_id))
-                return nodes, edges
-
-            def add_block_diagram_from_mermaid(document, nodes, edges):
-                if not edges:
-                    return
-                table = document.add_table(rows=len(edges), cols=3)
-                table.style = 'Table Grid'
-                for idx, (from_id, label, to_id) in enumerate(edges):
-                    from_text = nodes.get(from_id, from_id)
-                    to_text = nodes.get(to_id, to_id)
-
-                    row_cells = table.rows[idx].cells
-                    row_cells[0].text = f"【 {from_text.upper()} 】"
-                    row_cells[1].text = f" ───( {label} )───> " if label else " ───────> "
-                    row_cells[2].text = f"【 {to_text.upper()} 】"
-
-                    shade_cell(row_cells[0], "F2F5FA")
-                    shade_cell(row_cells[2], "EAF2FF")
-                    for col_idx in (0, 1, 2):
-                        for paragraph in row_cells[col_idx].paragraphs:
-                            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                            paragraph.paragraph_format.space_after = Pt(2)
-                            for run in paragraph.runs:
-                                set_font(run, 10, bold=(col_idx != 1))
-
-            lines = raw_text.splitlines()
-            idx = 0
-            while idx < len(lines):
-                line = lines[idx].strip()
-                if not line:
-                    idx += 1
-                    continue
-
-                if line.startswith("|"):
-                    table_lines = []
-                    while idx < len(lines) and lines[idx].strip().startswith("|"):
-                        table_lines.append(lines[idx])
-                        idx += 1
-                    table_rows = parse_markdown_table(table_lines)
-                    if table_rows and len(table_rows) >= 2:
-                        add_word_table_from_markdown(document, table_rows)
-                        # Spacer after table
-                        p_spacer = document.add_paragraph()
-                        p_spacer.paragraph_format.space_before = Pt(6)
-                        p_spacer.paragraph_format.space_after = Pt(6)
-                    else:
-                        for tl in table_lines:
-                            p = document.add_paragraph(tl)
-                            p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.ONE_POINT_FIVE
-                            p.paragraph_format.space_after = Pt(10)
-                    continue
-
-                if line.startswith("```mermaid") or line == "mermaid":
-                    mermaid_lines = []
-                    if line.startswith("```mermaid"):
-                        idx += 1
-                        while idx < len(lines) and not lines[idx].strip().startswith("```"):
-                            mermaid_lines.append(lines[idx])
-                            idx += 1
-                        if idx < len(lines):
-                            idx += 1
-                    else:
-                        idx += 1
-                        while idx < len(lines) and (lines[idx].strip().startswith("graph") or lines[idx].strip().startswith("flowchart") or "-->" in lines[idx] or ";" in lines[idx]):
-                            mermaid_lines.append(lines[idx])
-                            idx += 1
-
-                    nodes, edges = parse_mermaid(mermaid_lines)
-                    if edges:
-                        add_block_diagram_from_mermaid(document, nodes, edges)
-                        # Spacer after diagram
-                        p_spacer = document.add_paragraph()
-                        p_spacer.paragraph_format.space_before = Pt(6)
-                        p_spacer.paragraph_format.space_after = Pt(6)
-                    else:
-                        if nodes:
-                            p = document.add_paragraph("Process Elements:")
-                            p.paragraph_format.space_after = Pt(4)
-                            for nid, ntxt in nodes.items():
-                                np = document.add_paragraph(style='List Bullet')
-                                np.add_run(f"{ntxt}")
-                                np.paragraph_format.space_after = Pt(2)
-                    continue
-
-                paragraph_text = line
+            paragraphs = [line.strip() for line in re.split(r"\n+", raw_text) if line.strip()]
+            for paragraph_text in paragraphs:
                 paragraph_text = re.sub(r"^#{1,6}\s*", "", paragraph_text)
                 paragraph_text = re.sub(r"^[-*+]\s+", "- ", paragraph_text)
                 paragraph_text = paragraph_text.replace("**", "").replace("__", "").replace("`", "")
 
-                is_bullet = paragraph_text.startswith("- ")
-                if is_bullet:
-                    p = document.add_paragraph(style='List Bullet')
-                    paragraph_text = paragraph_text[2:].strip()
-                else:
-                    p = document.add_paragraph()
-                
+                p = document.add_paragraph()
                 p.alignment = WD_ALIGN_PARAGRAPH.LEFT if is_reference else WD_ALIGN_PARAGRAPH.JUSTIFY
                 p.paragraph_format.line_spacing_rule = WD_LINE_SPACING.ONE_POINT_FIVE
-                p.paragraph_format.space_after = Pt(4) if is_bullet else Pt(10)
+                p.paragraph_format.space_after = Pt(10)
                 p.paragraph_format.left_indent = Inches(0)
                 p.paragraph_format.right_indent = Inches(0)
-
+                
                 if is_reference:
                     match = re.match(r"^(\d+)\.\s+(.*)$", paragraph_text)
                     if match:
@@ -2232,8 +1995,6 @@ F) HUMAN VOICE: Write like a real expert - not a textbook. Use rhetorical questi
                 run = p.add_run(paragraph_text)
                 set_font(run, 12)
                 self.all_content.append(paragraph_text)
-                idx += 1
-
 
         def add_front_detail(document, text, bold=False, space_before=0):
             if not text:
@@ -2282,7 +2043,7 @@ F) HUMAN VOICE: Write like a real expert - not a textbook. Use rhetorical questi
                 import subprocess
                 import tempfile
 
-                executable = BaseReportEngine._find_libreoffice_executable()
+                executable = ReportEngine._find_libreoffice_executable()
                 if not executable:
                     raise RuntimeError("LibreOffice is not installed.")
 
@@ -2393,18 +2154,11 @@ F) HUMAN VOICE: Write like a real expert - not a textbook. Use rhetorical questi
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
             p.paragraph_format.space_after = Pt(24)
             p.paragraph_format.space_before = Pt(24)
-            section_label = self._get_section_label()
-            if section_label:
-                run = p.add_run(f"{section_label.upper()} {chapter_num}\n{title}")
-            else:
-                run = p.add_run(f"{title}")
+            run = p.add_run(f"CHAPTER {chapter_num}\n{title}")
             set_font(run, 18, bold=True)
             if bookmark_name:
                 add_bookmark(p, bookmark_name)
-            if section_label:
-                self.all_content.append(f"{section_label.upper()} {chapter_num}: {title}")
-            else:
-                self.all_content.append(f"{title}")
+            self.all_content.append(f"CHAPTER {chapter_num}: {title}")
 
         def add_subsection_title(document, subsection_id, title, bookmark_name=None):
             p = document.add_paragraph()
@@ -2777,9 +2531,9 @@ F) HUMAN VOICE: Write like a real expert - not a textbook. Use rhetorical questi
                 department_detail = f" of {self.metadata['department']}" if self.metadata['department'] else ""
                 period_detail = f" during {self.metadata['session']}" if self.metadata['session'] else ""
                 company_detail = f" at {self.metadata['companyName']}" if self.metadata.get('companyName') else ""
-                training_detail = f" for {self.metadata['trainingDuration']}" if self.metadata['trainingDuration'] else ""
-                mentor_detail = f" under the mentorship of {self.metadata['mentorName']}" if self.metadata['mentorName'] else ""
-                research_detail = f" for {self.metadata['degreeName']}" if self.metadata['degreeName'] and is_research_report else ""
+                training_detail = f" for {self.metadata['trainingDuration']}" if self.metadata.get('trainingDuration') else ""
+                mentor_detail = f" under the mentorship of {self.metadata['mentorName']}" if self.metadata.get('mentorName') else ""
+                research_detail = f" for {self.metadata['degreeName']}" if self.metadata.get('degreeName') and is_research_report else ""
                 purpose_detail = f" as part of {self.metadata['submissionPurpose']}" if self.metadata.get('submissionPurpose') else ""
                 if self.metadata.get('customCertificateText'):
                     add_custom_page_text(doc, self.metadata['customCertificateText'], WD_ALIGN_PARAGRAPH.JUSTIFY)
@@ -2927,10 +2681,13 @@ F) HUMAN VOICE: Write like a real expert - not a textbook. Use rhetorical questi
             chapter_count = max(1, len(self.plan["chapters"]))
             target_pages = int(self.metadata.get("targetPages") or 70)
             report_type_lower = str(self.metadata.get("reportType") or "").lower()
-            
-            front_matter_pages = 7 if self.metadata.get("includeFrontMatter", True) else 1
-            main_target_pages = max(1, target_pages - front_matter_pages)
-            pages_per_chapter = max(1, main_target_pages // chapter_count)
+            if "research paper" in report_type_lower:
+                pass
+            else:
+                target_pages = max(target_pages, chapter_count + 8)
+            front_matter_pages = 6
+            main_target_pages = max(chapter_count + 2, target_pages - front_matter_pages)
+            pages_per_chapter = max(2, main_target_pages // chapter_count)
 
             front_page_labels = {
                 "bm_certificate": "i",
@@ -2951,15 +2708,9 @@ F) HUMAN VOICE: Write like a real expert - not a textbook. Use rhetorical questi
             for chapter in self.plan["chapters"]:
                 chapter_bookmark = f"bm_chapter_{chapter['id']}"
                 chapter_start_page = 1 + ((chapter["id"] - 1) * pages_per_chapter)
-                section_label = self._get_section_label()
-                if section_label:
-                    entry_text = f"{section_label} {chapter['id']}: {chapter['title']}"
-                else:
-                    entry_text = f"{chapter['id']}. {chapter['title']}"
-                
                 add_toc_entry(
                     doc,
-                    entry_text,
+                    f"Chapter {chapter['id']}: {chapter['title']}",
                     chapter_bookmark,
                     bold=True,
                     page_label=str(chapter_start_page),
@@ -2977,106 +2728,76 @@ F) HUMAN VOICE: Write like a real expert - not a textbook. Use rhetorical questi
             references_page_estimate = 1 + (chapter_count * pages_per_chapter)
             add_toc_entry(doc, "References", "bm_references", bold=True, page_label=str(references_page_estimate))
 
-            has_tables = any(ch.get('hasTable') for ch in self.plan["chapters"])
-            if has_tables:
-                doc.add_page_break()
-                p = doc.add_paragraph()
-                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                p.paragraph_format.space_after = Pt(24)
-                run = p.add_run("LIST OF TABLES")
-                set_font(run, 16, bold=True)
-                add_bookmark(p, "bm_lot")
-                table_counter = 1
-                for chapter in self.plan["chapters"]:
-                    if chapter.get('hasTable'):
-                        chapter_start_page = 1 + ((chapter["id"] - 1) * pages_per_chapter)
-                        for table_label in ("Summary and Metrics", "Performance Evaluation"):
-                            add_toc_entry(
-                                doc,
-                                f"Table {table_counter}: {chapter['title']} {table_label}",
-                                f"bm_table_{table_counter}",
-                                page_label=str(chapter_start_page + 1),
-                            )
-                            table_counter += 1
-
-            has_figures = any(ch.get('hasFigure') for ch in self.plan["chapters"])
-            if has_figures:
-                doc.add_page_break()
-                p = doc.add_paragraph()
-                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                p.paragraph_format.space_after = Pt(24)
-                run = p.add_run("LIST OF FIGURES")
-                set_font(run, 16, bold=True)
-                add_bookmark(p, "bm_lof")
-                figure_counter = 1
-                for chapter in self.plan["chapters"]:
-                    if chapter.get('hasFigure'):
-                        chapter_start_page = 1 + ((chapter["id"] - 1) * pages_per_chapter)
-                        for figure_label in ("Architecture Diagram", "Workflow Process"):
-                            add_toc_entry(
-                                doc,
-                                f"Figure {figure_counter}: {chapter['title']} {figure_label}",
-                                f"bm_figure_{figure_counter}",
-                                page_label=str(chapter_start_page + 1),
-                            )
-                            figure_counter += 1
-
-            # ---------------------------
-            # CHAPTERS 1-7 - ARABIC NUMERALS (inside front matter block)
-            # ---------------------------
-        # Only add a section break if front matter was written — this break switches
-        # from roman numeral (front matter) to arabic numeral (chapter) page numbering.
-        # Without front matter, no section break is needed and none is added (avoids blank page).
-        if self.metadata.get('includeFrontMatter', True):
-            doc.add_section(WD_SECTION.NEW_PAGE)
-            chapter_section = doc.sections[-1]
-            chapter_section.page_height = Inches(11.69)
-            chapter_section.page_width = Inches(8.27)
-            chapter_section.left_margin = Inches(1.25)
-            chapter_section.right_margin = Inches(1.0)
-            chapter_section.top_margin = Inches(1.0)
-            chapter_section.bottom_margin = Inches(1.0)
-            configure_section_page_numbers(chapter_section, 1, 'decimal')
-            set_section_header(chapter_section)
-            set_section_footer_page_field(chapter_section, 'PAGE')
-        else:
-            # No front matter: just add a page break to separate the title page from chapter 1.
-            # Do NOT add a new section (that creates a blank page).
             doc.add_page_break()
-            chapter_section = doc.sections[0]
-            chapter_section.different_first_page_header_footer = True
-            configure_section_page_numbers(chapter_section, 1, 'decimal')
-            set_section_header(chapter_section)
-            set_section_footer_page_field(chapter_section, 'PAGE')
 
+            # List of Tables
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.paragraph_format.space_after = Pt(24)
+            run = p.add_run("LIST OF TABLES")
+            set_font(run, 16, bold=True)
+            add_bookmark(p, "bm_lot")
+
+            table_counter = 1
+            for chapter in self.plan["chapters"]:
+                if 'hasTable' in chapter and chapter['hasTable']:
+                    chapter_start_page = 1 + ((chapter["id"] - 1) * pages_per_chapter)
+                    for table_label in ("Summary and Metrics", "Performance Evaluation"):
+                        add_toc_entry(
+                            doc,
+                            f"Table {table_counter}: {chapter['title']} {table_label}",
+                            f"bm_table_{table_counter}",
+                            page_label=str(chapter_start_page + 1),
+                        )
+                        table_counter += 1
+
+            doc.add_page_break()
+
+            # List of Figures
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.paragraph_format.space_after = Pt(24)
+            run = p.add_run("LIST OF FIGURES")
+            set_font(run, 16, bold=True)
+            add_bookmark(p, "bm_lof")
+
+            figure_counter = 1
+            for chapter in self.plan["chapters"]:
+                if 'hasFigure' in chapter and chapter['hasFigure']:
+                    chapter_start_page = 1 + ((chapter["id"] - 1) * pages_per_chapter)
+                    for figure_label in ("Architecture Diagram", "Workflow Process"):
+                        add_toc_entry(
+                            doc,
+                            f"Figure {figure_counter}: {chapter['title']} {figure_label}",
+                            f"bm_figure_{figure_counter}",
+                            page_label=str(chapter_start_page + 1),
+                        )
+                        figure_counter += 1
+
+            doc.add_page_break()
+
+            # ---------------------------
+            # CHAPTERS 1-7 - ARABIC NUMERALS
+            # ---------------------------
+        doc.add_section(WD_SECTION.NEW_PAGE)
+        chapter_section = doc.sections[-1]
+        chapter_section.page_height = Inches(11.69)
+        chapter_section.page_width = Inches(8.27)
+        chapter_section.left_margin = Inches(1.25)
+        chapter_section.right_margin = Inches(1.0)
+        chapter_section.top_margin = Inches(1.0)
+        chapter_section.bottom_margin = Inches(1.0)
+        configure_section_page_numbers(chapter_section, 1, 'decimal')
+        set_section_header(chapter_section)
+        set_section_footer_page_field(chapter_section, 'PAGE')
 
         # Reset counters
         table_counter = 1
         figure_counter = 1
-        _cumulative_content_words = 0  # tracks total words written to chapters so far
-
-        # --- REAL-TIME PAGE TRACKING ---
-        target_pages = int(self.metadata.get("targetPages") or 65)
-        has_front_matter = self.metadata.get("includeFrontMatter", True)
-        # Only subtract front matter pages from the target when front matter is actually enabled.
-        # When front matter is OFF, content starts from page 1 of the docx.
-        FRONT_MATTER_PAGES = 8 if has_front_matter else 0
-        content_target_pages = max(1, target_pages - FRONT_MATTER_PAGES)
-        chapter_list = self.plan["chapters"]
-        chapter_count = max(1, len(chapter_list))
-        # Auto-calibrated from real LibreOffice output on first use.
-        WORDS_PER_PAGE = self._calibrate_words_per_page()
         
-        # Initialize per-section budget
-        # Will be refined after each chapter based on real page measurements
-        self.realtime_words_per_section = None  # triggers initial calculation in _generate_chapter_bundle
-
         # Chapters
         self._generate_references()
-        for chapter_index, chapter in enumerate(chapter_list):
-            chapters_remaining_after = chapter_count - chapter_index - 1
-            chapter_words = 0
-
+        for chapter in self.plan["chapters"]:
             add_chapter_title(
                 doc,
                 chapter['id'],
@@ -3085,7 +2806,6 @@ F) HUMAN VOICE: Write like a real expert - not a textbook. Use rhetorical questi
             )
 
             intro_content = self.generate_chapter_content(chapter['id'])
-            chapter_words += len(intro_content.split())
             add_normal_text(doc, intro_content)
 
             for subsection in chapter["subsections"]:
@@ -3097,7 +2817,6 @@ F) HUMAN VOICE: Write like a real expert - not a textbook. Use rhetorical questi
                 )
 
                 content = self.generate_chapter_content(chapter['id'], subsection['id'])
-                chapter_words += len(content.split())
                 add_normal_text(doc, content)
 
             if 'hasTable' in chapter and chapter['hasTable']:
@@ -3131,119 +2850,23 @@ F) HUMAN VOICE: Write like a real expert - not a textbook. Use rhetorical questi
                     bookmark_name=f"bm_figure_{figure_counter}",
                 )
                 figure_counter += 1
-
-            if chapter != chapter_list[-1]:
-                doc.add_page_break()
-
-
-            # Track cumulative content words written in the chapter loop only.
-            # doc.paragraphs includes front matter TOC/title paragraphs which would
-            # inflate the word count — so we track via chapter_words_total instead.
-            if chapters_remaining_after > 0:
-                # _cumulative_content_words tracks only chapter content words written so far
-                _cumulative_content_words += chapter_words
-
-                # Each chapter (except the last) adds one page break BEFORE the tracker runs,
-                # so we count chapter_index + 1 breaks (not chapter_index which is off-by-one).
-                _chapter_breaks_so_far = chapter_index + 1
-
-                # Estimated pages = content text pages + page breaks between chapters
-                _text_pages = _cumulative_content_words / WORDS_PER_PAGE
-                _estimated_total_pages = _text_pages + _chapter_breaks_so_far
-
-                # Content pages used (subtract front matter budget)
-                _content_pages_used = _estimated_total_pages  # no front matter subtraction needed
-                # Content pages remaining
-                _content_pages_remaining = max(0.5, content_target_pages - _content_pages_used)
-
-                # Recalculate words-per-section for ALL remaining chapter sections
-                _remaining_subsections = sum(
-                    len(c.get("subsections", [])) + 0.5
-                    for c in chapter_list[chapter_index + 1:]
-                )
-                _remaining_subsections = max(1, _remaining_subsections)
-                _new_wps = max(30, int((_content_pages_remaining * WORDS_PER_PAGE) / _remaining_subsections))
-                _new_wps = min(4000, _new_wps)
-                self.realtime_words_per_section = _new_wps
-
-                # Only print to server log — do NOT call progress_callback here.
-                # The Gemini call completion already triggers progress_callback with
-                # "chapter N" in the message, which the frontend shows as "Chapter N written".
-                # Calling it again here causes double entries in the UI.
-                print(
-                    f"[PageTracker] Ch{chapter['id']}: cumulative_words={_cumulative_content_words}, "
-                    f"text_pages={round(_text_pages,1)}, breaks={_chapter_breaks_so_far}, "
-                    f"est={round(_estimated_total_pages,1)}, remaining={round(_content_pages_remaining,1)}p, "
-                    f"next_wps={_new_wps}"
-                )
-
-
+            
+            doc.add_page_break()
 
         # References
-        if self.generated_references:
-            # 1. Gather all document text (paragraphs and tables) to check for citations
-            doc_text = ""
-            for p in doc.paragraphs:
-                doc_text += p.text + " \n"
-            for t in doc.tables:
-                for row in t.rows:
-                    for cell in row.cells:
-                        doc_text += cell.text + " \n"
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.paragraph_format.space_after = Pt(24)
+        run = p.add_run("REFERENCES")
+        set_font(run, 16, bold=True)
+        add_bookmark(p, "bm_references")
 
-            used_refs = []
-            ref_mapping = {}
-            new_idx = 1
-            for ref in self.generated_references:
-                match = re.match(r"^(\d+)\.\s*(.*)", ref)
-                if match:
-                    old_num = match.group(1)
-                    ref_body = match.group(2)
-                    is_cited = False
-                    # IEEE style check: "[X]"
-                    if f"[{old_num}]" in doc_text:
-                        is_cited = True
-                    else:
-                        # APA/Author check
-                        author_match = re.search(r"^[A-Za-z\-]+", ref_body)
-                        if author_match:
-                            author = author_match.group(0)
-                            if len(author) > 3 and re.search(r"\b" + re.escape(author) + r"\b", doc_text, re.I):
-                                is_cited = True
-                    if is_cited:
-                        used_refs.append((old_num, ref_body))
-                        ref_mapping[old_num] = new_idx
-                        new_idx += 1
+        # Reference uploads guide the AI only. Their temporary filenames must not
+        # appear in the final report because they may be personal draft files.
+        references = self.generated_references
 
-            if used_refs:
-                # Update text in paragraphs
-                for p in doc.paragraphs:
-                    for old_num, new_num in ref_mapping.items():
-                        p.text = p.text.replace(f"[{old_num}]", f"__REF_{new_num}__")
-                    for old_num, new_num in ref_mapping.items():
-                        p.text = p.text.replace(f"__REF_{new_num}__", f"[{new_num}]")
-                # Update text in tables
-                for t in doc.tables:
-                    for row in t.rows:
-                        for cell in row.cells:
-                            for p in cell.paragraphs:
-                                for old_num, new_num in ref_mapping.items():
-                                    p.text = p.text.replace(f"[{old_num}]", f"__REF_{new_num}__")
-                                for old_num, new_num in ref_mapping.items():
-                                    p.text = p.text.replace(f"__REF_{new_num}__", f"[{new_num}]")
-                self.generated_references = [f"{new_num}. {ref_body}" for old_num, ref_body in used_refs]
-
-            doc.add_page_break()
-            p = doc.add_paragraph()
-            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            p.paragraph_format.space_after = Pt(24)
-            run = p.add_run("REFERENCES")
-            set_font(run, 16, bold=True)
-            add_bookmark(p, "bm_references")
-
-            # Reference uploads guide the AI only. Their temporary filenames must not
-            # appear in the final report because they may be personal draft files.
-            for ref in self.generated_references:
-                add_normal_text(doc, ref, is_reference=True)
+        for ref in references:
+            add_normal_text(doc, ref, is_reference=True)
 
         # Generate unique filename
         author_slug = self._filename_slug(self.metadata.get("studentName"), "user")
