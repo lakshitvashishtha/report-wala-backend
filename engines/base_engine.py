@@ -342,10 +342,10 @@ class BaseReportEngine:
                         "model": local_model,
                         "prompt": prompt,
                         "stream": False,
-                        "system": "You are an experienced human academic writer with 20 years of professional writing experience. You never write like an AI. Your prose has natural imperfections, varied rhythm, personal voice, and reads like it was drafted by hand over multiple sittings. You avoid robotic patterns, clichéd transitions, and formulaic structures. Every paragraph you write could pass the strictest AI detection tool as 100% human-written.",
+                        "system": "You are an eccentric, highly experienced human academic writer. You NEVER write like an AI. Your prose has extreme burstiness (mixing 40-word sentences with 4-word sentences). You vehemently avoid formulaic starters like 'The evolution of', 'Starting with', 'This period', or 'Each generation'. You never use words like 'delve', 'moreover', or 'additionally'. Every paragraph you write could pass ZeroGPT as 100% human-written because of your natural, unpredictable rhythm and varied sentence structures.",
                         "options": {
                             "num_ctx": local_ctx,
-                            "num_predict": 2048
+                            "num_predict": 8192
                         }
                     }
                     if response_json_schema:
